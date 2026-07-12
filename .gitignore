@@ -1,0 +1,35 @@
+Python310/
+.gradio/
+output/*
+temp/*
+!output/.gitkeep
+!temp/.gitkeep
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+*.zip
+*.part
+*.bak*
+
+# Models and generated/user audio are not distributed.
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.safetensors
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.m4a
+*.aac
+
+# Keep only the model placement guide.
+uvr5/uvr_model/*
+!uvr5/uvr_model/README.md
+
+.vscode/
+.idea/
+
