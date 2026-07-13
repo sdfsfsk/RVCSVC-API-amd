@@ -84,8 +84,14 @@ svc_base_url = http://127.0.0.1:9999/
 
 - `/convert`：下载/读取歌曲、UVR5 分离、调用上游、混音并返回结果。
 - `/show_model`：读取上游可用模型。
+- `/cache_info`：返回结果缓存与分离缓存的文件数、占用空间。
+- `/clear_cache`：在无推理任务运行时清理 `all`、`results` 或 `separation` 缓存。
 - 结果按歌曲和所有关键参数哈希保存在 `temp/`；参数完全一致时直接返回缓存。
 - `app.queue(..., api_open=True)` 必须保持启用，否则 AstrBot 的 `gradio_client` 无法调用。
+- 本地音频缓存使用文件内容 SHA256，不会因路径变化误复用；模型文件变化也会自动使旧结果缓存失效。
+- 默认保留上游 RVC/SVC 原始人声，只在插件开启 `vocal_postprocess` 时应用 EQ、压缩、延迟与混响；导出前执行削峰保护并使用 320 kbps MP3。
+- `RVCSVC_CACHE_MAX_FILES`（默认 200）限制每个缓存区域文件数；`RVCSVC_OUTPUT_BITRATE` 可修改输出码率。
+- 服务默认仅监听 `127.0.0.1` 且不创建公网分享链接；需要局域网监听时显式设置 `RVCSVC_HOST`，公开分享需设置 `RVCSVC_SHARE=1`。
 
 ## 注意事项
 
@@ -97,4 +103,3 @@ svc_base_url = http://127.0.0.1:9999/
 ## 来源与许可状态
 
 中间层基于 [CCYellowStar2/RVCSVC-API](https://github.com/CCYellowStar2/RVCSVC-API) 修改；该上游仓库在本项目发布时未声明开源许可证，因此本仓库不擅自为继承代码授予额外许可。第三方 UVR5 组件及其许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
-

@@ -5,6 +5,7 @@ import torch
 import shutil
 import argparse
 import threading
+from functools import wraps
 from difflib import SequenceMatcher
 
 progress_local = threading.local()
@@ -55,6 +56,120 @@ models=[]
 index=[]
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 RVC_API_BASE = "http://127.0.0.1:2333"
+PIPELINE_VERSION = "rvcsvc-rvc-v2"
+OUTPUT_BITRATE = os.environ.get("RVCSVC_OUTPUT_BITRATE", "320k")
+CACHE_MAX_FILES = max(10, int(os.environ.get("RVCSVC_CACHE_MAX_FILES", "200")))
+CONVERT_LOCK = threading.RLock()
+_SOURCE_HASH_CACHE = {}
+
+def _env_flag(name, default=False):
+  value = os.environ.get(name)
+  if value is None:
+    return bool(default)
+  return value.strip().lower() in {"1", "true", "yes", "on"}
+
+def _serialized(fn):
+  @wraps(fn)
+  def wrapped(*args, **kwargs):
+    with CONVERT_LOCK:
+      return fn(*args, **kwargs)
+  return wrapped
+
+def _sha256_file(path):
+  resolved = os.path.abspath(path)
+  stat = os.stat(resolved)
+  cache_key = (resolved, stat.st_size, stat.st_mtime_ns)
+  cached = _SOURCE_HASH_CACHE.get(cache_key)
+  if cached:
+    return cached
+  digest = hashlib.sha256()
+  with open(resolved, "rb") as stream:
+    for block in iter(lambda: stream.read(1024 * 1024), b""):
+      digest.update(block)
+  value = digest.hexdigest()
+  _SOURCE_HASH_CACHE.clear()
+  _SOURCE_HASH_CACHE[cache_key] = value
+  return value
+
+def _rvc_model_fingerprint(model):
+  basename = os.path.basename(str(model or ""))
+  root = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "RVC", "RVC", "amd"))
+  assets = []
+  if os.path.isdir(root):
+    for current, _, files in os.walk(root):
+      for filename in files:
+        if filename == basename or (
+          filename.lower().endswith(".index")
+          and os.path.splitext(basename)[0].lower() in filename.lower()
+        ):
+          path = os.path.join(current, filename)
+          stat = os.stat(path)
+          assets.append((os.path.relpath(path, root), stat.st_size, stat.st_mtime_ns))
+  payload = json.dumps(sorted(assets), ensure_ascii=True).encode("utf-8")
+  return hashlib.sha256(payload).hexdigest()[:16] if assets else "missing"
+
+def _cache_areas():
+  return {"results": os.path.join(SCRIPT_DIR, "temp"), "separation": os.path.join(SCRIPT_DIR, "output")}
+
+def _cache_files(root):
+  if not os.path.isdir(root):
+    return []
+  return [
+    os.path.join(current, name)
+    for current, _, names in os.walk(root)
+    for name in names
+    if not name.startswith(".git")
+  ]
+
+def cache_info():
+  areas = {}
+  for name, root in _cache_areas().items():
+    files = _cache_files(root)
+    areas[name] = {"files": len(files), "bytes": sum(os.path.getsize(path) for path in files if os.path.isfile(path))}
+  return {
+    "service": "RVCSVC-API RVC",
+    "areas": areas,
+    "total_files": sum(item["files"] for item in areas.values()),
+    "total_bytes": sum(item["bytes"] for item in areas.values()),
+  }
+
+@_serialized
+def clear_cache(scope="all"):
+  selected = _cache_areas() if str(scope).lower() == "all" else {
+    key: value for key, value in _cache_areas().items() if key == str(scope).lower()
+  }
+  deleted = freed = 0
+  for root in selected.values():
+    for path in _cache_files(root):
+      try:
+        size = os.path.getsize(path)
+        os.remove(path)
+        deleted += 1
+        freed += size
+      except OSError:
+        pass
+    if os.path.isdir(root):
+      for current, dirs, _ in os.walk(root, topdown=False):
+        for directory in dirs:
+          try:
+            os.rmdir(os.path.join(current, directory))
+          except OSError:
+            pass
+  return {"deleted_files": deleted, "freed_bytes": freed, "scope": str(scope)}
+
+def _trim_cache():
+  areas = _cache_areas()
+  results = sorted((p for p in _cache_files(areas["results"]) if os.path.isfile(p)), key=os.path.getmtime, reverse=True)
+  for path in results[CACHE_MAX_FILES:]:
+    try:
+      os.remove(path)
+    except OSError:
+      pass
+  root = areas["separation"]
+  jobs = [os.path.join(group.path, child.name) for group in os.scandir(root) if group.is_dir() for child in os.scandir(group.path) if child.is_dir()] if os.path.isdir(root) else []
+  jobs.sort(key=lambda path: max((os.path.getmtime(p) for p in _cache_files(path)), default=0), reverse=True)
+  for path in jobs[CACHE_MAX_FILES:]:
+    shutil.rmtree(path, ignore_errors=True)
 
 # ========== 新增：音高优化函数 ==========
 def optimize_pitch_shift(key_shift):
@@ -78,7 +193,7 @@ def get_response(song_id):
       return response
   except Exception as e:
     print(f"主源下载失败: {e}")
-  
+
   print("使用备用源下载歌曲")
   try:
       response1 = requests.get(
@@ -93,17 +208,21 @@ def get_response(song_id):
 def change_model(model):
   """切换模型"""
   try:
-    response = requests.post(f"{RVC_API_BASE}/run/infer_change_voice", json={
+    http_response = requests.post(f"{RVC_API_BASE}/run/infer_change_voice", json={
       "data": [
         model,
         0.33,
         0.33,
-    ]}, timeout=10).json()
+    ]}, timeout=10)
+    http_response.raise_for_status()
+    response = http_response.json()
+    if response.get("error") or "data" not in response:
+      raise RuntimeError(response.get("error") or f"无效响应: {response}")
     print(f"模型已切换为: {model}")
     return f"✅ 成功切换到模型: {model}"
   except Exception as e:
     print(f"切换模型失败: {e}")
-    return f"❌ 切换模型失败: {e}"
+    raise RuntimeError(f"切换模型失败: {e}") from e
 
 def show_model():
   """获取可用模型列表"""
@@ -239,7 +358,8 @@ def wwy_downloader(
 
 
 
-def convert(song_name_src, key_shift, vocal_vol, inst_vol, model_dropdown, reverb_intensity = 4, delay_intensity = 0, f0_method = "rmvpe", index_rate = 0.75, filter_radius = 3, uvr5_agg = 10, uvr5_tta = False, uvr5_postprocess = False, uvr5_window_size = 512, uvr5_high_end_process = "mirroring", msst_batch_size = 2, msst_num_overlap = 4, msst_normalize = True, shift_accompaniment=True, progress=gr.Progress()):
+@_serialized
+def convert(song_name_src, key_shift, vocal_vol, inst_vol, model_dropdown, reverb_intensity = 4, delay_intensity = 0, f0_method = "rmvpe", index_rate = 0.75, filter_radius = 3, uvr5_agg = 10, uvr5_tta = False, uvr5_postprocess = False, uvr5_window_size = 512, uvr5_high_end_process = "mirroring", msst_batch_size = 2, msst_num_overlap = 4, msst_normalize = True, vocal_postprocess=False, shift_accompaniment=True, progress=gr.Progress()):
   """进行翻唱推理合成"""
   print(f"🎵 [任务开始] RVC模型: {model_dropdown} | 算法: {f0_method} | 检索率: {index_rate} | 滤波: {filter_radius} | 升降调: {key_shift}")
   print(f"🔧 [UVR5 参数] Agg: {uvr5_agg} | TTA: {uvr5_tta} | PostProcess: {uvr5_postprocess} | WindowSize: {uvr5_window_size} | HighEnd: {uvr5_high_end_process}")
@@ -261,13 +381,34 @@ def convert(song_name_src, key_shift, vocal_vol, inst_vol, model_dropdown, rever
   
   # === 检查是否为本地文件路径（支持QQ音乐等外部音频） ===
   is_local_file = os.path.isfile(song_name_src) and not song_name_src.startswith("http")
-  
   if is_local_file:
-    # 本地文件（QQ音乐等）：生成安全的缓存名称（使用哈希避免中文/特殊字符问题）
-    safe_name = f"qqmusic_{abs(hash(song_name_src)) % 10000000}"
-    # 【关键修复】替换 song_name_src 为安全名称，确保后续所有路径构建都正确
-    original_song_name = song_name_src
+    original_song_name = os.path.abspath(song_name_src)
+    source_fingerprint = _sha256_file(original_song_name)
+    safe_name = f"local_{source_fingerprint[:16]}"
     song_name_src = safe_name
+    source_cache_name = safe_name
+  else:
+    netease_safe_name = f"netease_{song_name_src}"
+    source_cache_name = netease_safe_name
+
+  # 最终结果缓存必须在人声分离之前检查，真正做到命中即返回。
+  cache_key = _get_cache_key(
+      source_cache_name, model_dropdown, key_shift, vocal_vol, inst_vol,
+      reverb_intensity, delay_intensity, f0_method,
+      index_rate, filter_radius, uvr5_agg, uvr5_tta,
+      uvr5_postprocess, uvr5_window_size, uvr5_high_end_process,
+      msst_batch_size, msst_num_overlap, msst_normalize,
+      vocal_postprocess, shift_accompaniment
+  )
+  cache_path = f"temp/{sanitize_filename(source_cache_name)}_{cache_key}_RVC.mp3"
+  if os.path.isfile(cache_path) and os.path.getsize(cache_path) > 0:
+      os.utime(cache_path, None)
+      print(f"Cache hit, returning: {cache_path}")
+      progress(1.0, desc="Cache hit, returning directly!")
+      progress_local.progress = None
+      return cache_path, "true"
+
+  if is_local_file:
     vocal_cache_path = f"./output/{split_model}/{safe_name}/vocal_{safe_name}.wav_10.wav"
     
     if os.path.isfile(vocal_cache_path):
@@ -304,7 +445,6 @@ def convert(song_name_src, key_shift, vocal_vol, inst_vol, model_dropdown, rever
         raise gr.Error(f"人声分离失败，未找到输出文件: {vocal_path}")
   else:
     # 网易云音乐：使用 netease_ 前缀标识
-    netease_safe_name = f"netease_{song_name_src}"
     vocal_cache_path = f"./output/{split_model}/{netease_safe_name}/vocal_{netease_safe_name}.wav_10.wav"
     
     if os.path.isfile(vocal_cache_path):
@@ -316,25 +456,6 @@ def convert(song_name_src, key_shift, vocal_vol, inst_vol, model_dropdown, rever
       progress(0.4, desc="网易云下载并分离人声...")
       audio_rvc, sr_src = librosa.load(wwy_downloader(song_name_src, split_model, cache_name=netease_safe_name, uvr5_pre_fun=uvr5_pre)[0], sr=44100, mono=True)
       soundfile.write(audio_rvc_path, audio_rvc, sr_src)
-
-  # ========== 缓存检查 ==========
-  cache_key = _get_cache_key(
-      song_name_src if is_local_file else netease_safe_name,
-      model_dropdown, key_shift, vocal_vol, inst_vol,
-      reverb_intensity, delay_intensity, f0_method,
-      index_rate, filter_radius, uvr5_agg, uvr5_tta,
-      uvr5_postprocess, uvr5_window_size, uvr5_high_end_process,
-      msst_batch_size, msst_num_overlap, msst_normalize,
-      shift_accompaniment
-  )
-  cache_name = song_name_src if is_local_file else netease_safe_name
-  cache_path = f"temp/{sanitize_filename(cache_name)}_{cache_key}_RVC.mp3"
-  if os.path.isfile(cache_path):
-      print(f"Cache hit, returning: {cache_path}")
-      progress(1.0, desc="Cache hit, returning directly!")
-      progress_local.progress = None
-      return cache_path, "true"
-  # =============================
 
   print("🎤 RVC 推理中...")
   progress(0.55, desc="切换RVC模型中...")
@@ -408,7 +529,11 @@ def convert(song_name_src, key_shift, vocal_vol, inst_vol, model_dropdown, rever
     os.makedirs("./temp", exist_ok=True)
 
     audio_data, sr = librosa.load(data, sr=None, mono=False)
-  elif data is None and len(response.get("data", [])) > 1 and isinstance(response["data"][1], tuple) or isinstance(response.get("data", [])[1], list):
+  elif (
+    data is None
+    and len(response.get("data", [])) > 1
+    and isinstance(response["data"][1], (tuple, list))
+  ):
     # Handling raw audio array response
     print("🎛️ 接收到直接音频数组，开始处理")
     progress(0.78, desc="加载推理结果音频...")
@@ -475,10 +600,10 @@ def convert(song_name_src, key_shift, vocal_vol, inst_vol, model_dropdown, rever
             attack_ms=5.0,
             release_ms=150.0
         ),
-    ]
+    ] if vocal_postprocess else []
     
     # ========== 只有当用户开启延迟时，才执行所有相关计算 ==========
-    if delay_intensity > 0:
+    if vocal_postprocess and delay_intensity > 0:
         print("🎤 启用回声效果，开始准备参数...")
         
         # 1. 自动检测歌曲BPM
@@ -524,21 +649,27 @@ def convert(song_name_src, key_shift, vocal_vol, inst_vol, model_dropdown, rever
     # ==========================================================
     
     # 最后添加混响效果器 (这总是在延迟之后)
-    effects.append(
-        Reverb(
-            room_size=room_size_val,
-            damping=0.4,
-            wet_level=wet_level_val,
-            dry_level=dry_level_val,
-            width=0.8
+    if vocal_postprocess and reverb_intensity > 0:
+        effects.append(
+            Reverb(
+                room_size=room_size_val,
+                damping=0.4,
+                wet_level=wet_level_val,
+                dry_level=dry_level_val,
+                width=0.8
+            )
         )
-    )
     
     # 用最终的效果器列表创建 Pedalboard
+    if vocal_postprocess:
+        print("🎛️ 已启用人声后处理（均衡/压缩/空间效果）")
+    else:
+        print("🎛️ 人声后处理已关闭，保留上游 RVC 原始音色")
     board = Pedalboard(effects)
 
-    processed = board(audio_data, sr)
-    processed_int16 = (processed.T * 32768).astype(np.int16)
+    processed = board(audio_data, sr) if effects else audio_data
+    processed = np.clip(processed, -1.0, 1.0 - (1.0 / 32768.0))
+    processed_int16 = np.rint(processed.T * 32768.0).astype(np.int16)
     processed_audio = AudioSegment(
         processed_int16.tobytes(),
         frame_rate=sr,
@@ -579,6 +710,10 @@ def convert(song_name_src, key_shift, vocal_vol, inst_vol, model_dropdown, rever
             
             # 从处理后的文件加载为 AudioSegment
             audio_inst = AudioSegment.from_file(shifted_inst_path, format="wav")
+            try:
+                os.remove(shifted_inst_path)
+            except OSError:
+                pass
             
             print(f"✅ 伴奏音高调整完成")
         except Exception as e:
@@ -594,6 +729,8 @@ def convert(song_name_src, key_shift, vocal_vol, inst_vol, model_dropdown, rever
 
     audio_inst = audio_inst + inst_vol
     combined_audio = normalized_audio.overlay(audio_inst)
+    if combined_audio.max_dBFS > -1.0:
+        combined_audio = combined_audio.apply_gain(-1.0 - combined_audio.max_dBFS)
 
     print("💾 导出最终文件...")
     progress(0.95, desc="导出最终音频文件...")
@@ -601,8 +738,9 @@ def convert(song_name_src, key_shift, vocal_vol, inst_vol, model_dropdown, rever
     combined_audio.export(
         output_path,
         format="MP3",
-        bitrate="192k"
+        bitrate=OUTPUT_BITRATE
     )
+    _trim_cache()
     
     if data and isinstance(data, str) and os.path.isfile(data):
       os.remove(data)
@@ -612,10 +750,12 @@ def convert(song_name_src, key_shift, vocal_vol, inst_vol, model_dropdown, rever
     progress_local.progress = None
     return output_path, "false"
 
-def _get_cache_key(song_name, model, key_shift, vocal_vol, inst_vol, reverb_intensity, delay_intensity, f0_method, index_rate, filter_radius, uvr5_agg, uvr5_tta, uvr5_postprocess, uvr5_window_size, uvr5_high_end_process, msst_batch_size, msst_num_overlap, msst_normalize, shift_accompaniment):
+def _get_cache_key(song_name, model, key_shift, vocal_vol, inst_vol, reverb_intensity, delay_intensity, f0_method, index_rate, filter_radius, uvr5_agg, uvr5_tta, uvr5_postprocess, uvr5_window_size, uvr5_high_end_process, msst_batch_size, msst_num_overlap, msst_normalize, vocal_postprocess, shift_accompaniment):
     params = {
+        "pipeline": PIPELINE_VERSION,
         "song": str(song_name),
         "model": str(model),
+        "model_assets": _rvc_model_fingerprint(model),
         "key_shift": float(key_shift),
         "vocal_vol": float(vocal_vol),
         "inst_vol": float(inst_vol),
@@ -632,6 +772,7 @@ def _get_cache_key(song_name, model, key_shift, vocal_vol, inst_vol, reverb_inte
         "msst_batch": float(msst_batch_size),
         "msst_overlap": float(msst_num_overlap),
         "msst_norm": bool(msst_normalize),
+        "vocal_postprocess": bool(vocal_postprocess),
         "shift_inst": bool(shift_accompaniment),
     }
     return hashlib.md5(json.dumps(params, sort_keys=True, ensure_ascii=True).encode("utf-8")).hexdigest()[:12]
@@ -725,6 +866,7 @@ with app:
   api_msst_batch_size = gr.Number(value=2, visible=False)
   api_msst_num_overlap = gr.Number(value=4, visible=False)
   api_msst_normalize = gr.Checkbox(value=True, visible=False)
+  api_vocal_postprocess = gr.Checkbox(value=False, visible=False)
   api_shift_accompaniment = gr.Checkbox(value=True, visible=False)
   api_output = gr.Audio(visible=False)
   api_cache_flag = gr.Textbox(visible=False)
@@ -736,9 +878,18 @@ with app:
   )
   gr.Button("API Convert", visible=False).click(
       convert,
-      inputs=[inp1, inp5, inp6, inp7, api_model_name, inp_reverb, inp_delay, api_f0_method, api_index_rate, api_filter_radius, api_uvr5_agg, api_uvr5_tta, api_uvr5_postprocess, api_uvr5_window_size, api_uvr5_high_end_process, api_msst_batch_size, api_msst_num_overlap, api_msst_normalize, api_shift_accompaniment],
+      inputs=[inp1, inp5, inp6, inp7, api_model_name, inp_reverb, inp_delay, api_f0_method, api_index_rate, api_filter_radius, api_uvr5_agg, api_uvr5_tta, api_uvr5_postprocess, api_uvr5_window_size, api_uvr5_high_end_process, api_msst_batch_size, api_msst_num_overlap, api_msst_normalize, api_vocal_postprocess, api_shift_accompaniment],
       outputs=[api_output, api_cache_flag],
       api_name="convert"
+  )
+  cache_scope = gr.Textbox(value="all", visible=False)
+  cache_json = gr.JSON(visible=False)
+  app.load(cache_info, inputs=[], outputs=cache_json, api_name="cache_info")
+  gr.Button("API Clear Cache", visible=False).click(
+      clear_cache,
+      inputs=[cache_scope],
+      outputs=[cache_json],
+      api_name="clear_cache"
   )
   gr.Markdown("### <center>注意❗：请不要生成会对个人以及组织造成侵害的内容，此程序仅供科研、学习及个人娱乐使用。</center>")
   gr.HTML('''
@@ -757,5 +908,10 @@ else:
     print("⚠️ 警告: 未能加载模型列表，请确保RVC服务正在运行")
 
 
-app.queue(max_size=40, api_open=True)
-app.launch(server_name="0.0.0.0", server_port=3333, share=True, show_error=True)
+app.queue(max_size=40, api_open=True, default_concurrency_limit=1)
+app.launch(
+    server_name=os.environ.get("RVCSVC_HOST", "127.0.0.1"),
+    server_port=3333,
+    share=_env_flag("RVCSVC_SHARE", False),
+    show_error=_env_flag("RVCSVC_SHOW_ERROR", False),
+)
