@@ -1,4 +1,6 @@
 Python310/
+runtime-rocm/
+ffmpeg/
 .gradio/
 output/*
 temp/*

@@ -3,7 +3,7 @@
 面向 [astrbot_plugin_matsuko_cover](https://github.com/sdfsfsk/matsuko_cover) 的 RVC / SVC-Fusion 中间层，使用 UVR5 分离人声和伴奏，并提供 Gradio API、结果缓存、音频后处理和进度回传。
 
 > [!CAUTION]
-> **此版本仅面向 Windows AMD 显卡（A 卡），使用 DirectML。NVIDIA、Intel GPU 和纯 CPU 环境不在支持范围内。**
+> **此版本仅面向 Windows AMD 显卡（A 卡），使用原生 AMD ROCm 7.2.1。NVIDIA、Intel GPU 和纯 CPU 环境不在支持范围内。**
 
 本仓库仅发布源码和环境安装脚本，不包含便携 Python、UVR5 权重、RVC/SVC 模型、歌曲、缓存或生成音频。
 
@@ -12,11 +12,13 @@
 | 项目 | RVCSVC-API-amd | [RVCSVC-API-MSST](https://github.com/sdfsfsk/RVCSVC-API-MSST) |
 |---|---|---|
 | 分离器 | UVR5 / HP5 | BS-Roformer / MSST |
-| GPU 后端 | DirectML | Windows AMD ROCm 7.2.1 |
-| 特点 | 环境较轻、兼容范围较广 | 分离质量更高、显存占用更大 |
+| GPU 后端 | Windows AMD ROCm 7.2.1 | Windows AMD ROCm 7.2.1 |
+| 特点 | 环境较轻、显存占用较小 | 分离质量更高、显存占用更大 |
 | 支持显卡 | 仅 AMD | 仅 AMD |
 
 两套中间层使用相同的 3333/9999 端口，不能同时启动。
+
+> 旧版 DirectML（torch-directml + Python310）已被原生 ROCm 取代；`--dml` 参数保留但会被忽略。若 `runtime-rocm/` 不存在，启动脚本会回退到旧的 `Python310/` DirectML 环境（如有）。
 
 ## 数据流和端口
 
@@ -31,20 +33,22 @@ AstrBot + matsuko_cover
 要求：
 
 - Windows 10/11 x64
-- AMD Radeon GPU 和可用的 DirectML 驱动
-- FFmpeg 已加入 `PATH`
+- AMD ROCm 7.2.1 支持的 Radeon 显卡（如 RX 9070 XT）及对应驱动
+- FFmpeg 已加入 `PATH`（或将 `ffmpeg/bin` 放到项目 `ffmpeg/` 目录下，启动脚本会自动加载）
 - 已准备上游 RVC 或 SVC-Fusion 服务
 
 运行：
 
 ```text
-install_env.bat
+install_rocm_env.bat
 ```
 
-脚本会下载官方 CPython 3.10.11 Embedded 到 `Python310/`，并安装 `requirements.txt`。也可以使用现有 Python 3.10 环境手动安装：
+脚本会下载官方 CPython 3.12 Embedded 到 `runtime-rocm/`，并安装 `requirements-rocm.txt`（AMD 官方 ROCm 7.2.1 版 PyTorch 2.9.1，约 4GB）。AMD 的 Windows ROCm wheel 目前只提供 cp312 版本，因此必须使用 Python 3.12。
+
+也可以使用现有 Python 3.12 环境手动安装：
 
 ```powershell
-python -m pip install -r requirements.txt
+python -m pip install -r requirements-rocm.txt
 ```
 
 ## UVR5 模型
@@ -69,8 +73,8 @@ uvr5/uvr_model/5_HP-Karaoke-UVR.pth
 手动启动：
 
 ```powershell
-Python310\python.exe app_rvc.py --dml --is_nohalf
-Python310\python.exe app_svc.py --dml --is_nohalf
+runtime-rocm\python.exe app_rvc.py --is_nohalf
+runtime-rocm\python.exe app_svc.py --is_nohalf
 ```
 
 插件默认地址：
@@ -97,7 +101,7 @@ svc_base_url = http://127.0.0.1:9999/
 
 - 服务会调用本机上游端口，不要将 3333/9999 直接暴露到公网。
 - `output/`、`temp/` 和下载音频可能包含受版权保护内容，已默认被 Git 忽略。
-- DirectML 不支持所有 CUDA 专用算子；若需要更高分离质量，使用 MSST 的原生 AMD ROCm 版本。
+- ROCm 版 PyTorch 通过 `torch.cuda` API 暴露 AMD GPU，应用代码无需 CUDA 专用改造；若需要更高分离质量，使用 MSST 版本。
 - 本项目不会自动提供上游 RVC/SVC 模型，使用者需自行遵守模型和音频许可。
 
 ## 来源与许可状态

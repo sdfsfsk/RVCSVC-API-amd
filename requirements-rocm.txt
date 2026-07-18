@@ -1,0 +1,26 @@
+# RVCSVC-API-amd 原生 AMD ROCm 运行时依赖（Python 3.12）
+#
+# torch / torchaudio 与 ROCm SDK 来自 AMD 官方 Windows ROCm 7.2.1 仓库，
+# 该仓库目前只提供 cp312 wheel，因此必须使用 Python 3.12。
+# 不要改回 PyPI 的 CUDA/CPU 版 torch。
+
+https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm_sdk_core-7.2.1-py3-none-win_amd64.whl
+https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm_sdk_devel-7.2.1-py3-none-win_amd64.whl
+https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm_sdk_libraries_custom-7.2.1-py3-none-win_amd64.whl
+https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm-7.2.1.tar.gz
+https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/torch-2.9.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl
+https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/torchaudio-2.9.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl
+
+numpy==1.26.4
+scipy==1.12.0
+numba==0.60.0
+llvmlite==0.43.0
+librosa==0.10.1
+soundfile==0.12.1
+resampy==0.4.2
+pydub==0.25.1
+gradio==6.12.0
+requests
+tqdm
+pedalboard==0.9.22
+setuptools

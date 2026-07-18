@@ -1,6 +1,8 @@
 import re, os, hashlib
 import requests, json, torch, shutil, argparse, base64, http.client
 import threading
+import soundfile
+import numpy as np
 from functools import wraps
 from difflib import SequenceMatcher
 from urllib.parse import urlparse
@@ -142,27 +144,18 @@ loaded_speakers = []
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--is_nohalf', action='store_true')
-parser.add_argument('--dml', action='store_true')
+parser.add_argument('--dml', action='store_true', help='(已废弃) DirectML 已被原生 AMD ROCm 取代')
 a = parser.parse_args()
 
-use_dml = a.dml
-if use_dml:
-    try:
-        import torch_directml
-        device = torch_directml.device(torch_directml.default_device())
-        is_half = False
-        print(f"[AMD] SVC API using DirectML device: {device}")
-    except ImportError:
-        print("[AMD] torch_directml not installed, falling back to CPU")
-        device = 'cpu'
-        is_half = False
+if a.dml:
+    print("[ROCm] --dml 参数已废弃，本版本使用原生 AMD ROCm，忽略该参数")
+
+is_half = not a.is_nohalf
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+if device == 'cuda':
+    print(f"[ROCm] PyTorch {torch.__version__}, HIP {torch.version.hip}, GPU: {torch.cuda.get_device_name(0)}")
 else:
-    is_half = not a.is_nohalf
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    if device == 'cuda':
-        print(f"[GPU] CUDA ready: {torch.cuda.get_device_name(0)}")
-    else:
-        print("[CPU] No GPU detected, using CPU")
+    print("[ROCm] 未检测到 AMD ROCm GPU，回退到 CPU（速度会很慢）")
 
 import time as _time
 
@@ -277,10 +270,6 @@ def _scan_models_from_fs():
     available_diffusion_configs = []
 
     scan_dirs = []
-
-    workdir = os.path.join(SVC_FUSION_ROOT, "exp", "workdir")
-    if os.path.isdir(workdir):
-        scan_dirs.append(workdir)
 
     models_dir = os.path.join(SVC_FUSION_ROOT, "models")
     if os.path.isdir(models_dir):
@@ -397,6 +386,86 @@ def _read_model_config(model_path):
             pass
     return {}
 
+
+def _is_valid_svc_model_dir(model_path):
+    if not model_path or not os.path.isdir(model_path):
+        return False
+    has_config = os.path.isfile(os.path.join(model_path, "config.yaml")) or os.path.isfile(os.path.join(model_path, "config.json"))
+    has_checkpoint = any(
+        name.endswith(".pt") and name != "model_0.pt"
+        for name in os.listdir(model_path)
+        if os.path.isfile(os.path.join(model_path, name))
+    )
+    return has_config and has_checkpoint
+
+
+def _model_config_signature(model_path):
+    for name in ("config.yaml", "config.json"):
+        config_path = os.path.join(model_path, name)
+        if os.path.isfile(config_path):
+            with open(config_path, "rb") as stream:
+                return hashlib.sha256(stream.read()).hexdigest()
+    return ""
+
+
+def _resolve_svc_model_path(model_name):
+    requested_display = str(model_name or "").strip()
+    if not requested_display:
+        raise ValueError("SVC 模型为空，请先刷新并选择一个有效模型")
+
+    import re as _re
+    requested = requested_display
+    match = _re.search(r"\(([^)]+)\)\s*$", requested)
+    if match:
+        requested = match.group(1).strip()
+    if not requested:
+        raise ValueError("SVC 模型为空，请先刷新并选择一个有效模型")
+
+    if not available_models:
+        refresh_models_svc()
+
+    root_norm = os.path.normcase(os.path.normpath(SVC_FUSION_ROOT))
+    direct_path = os.path.abspath(requested)
+    if os.path.normcase(os.path.normpath(direct_path)) == root_norm:
+        raise ValueError("SVC-Fusion 根目录不是模型目录，请选择具体模型")
+    if _is_valid_svc_model_dir(direct_path):
+        return direct_path
+
+    # Friendly models/* folders may only contain config.yaml. Resolve them to
+    # the timestamped archive folder with the same configuration and weights.
+    if os.path.isdir(direct_path):
+        direct_signature = _model_config_signature(direct_path)
+        if direct_signature:
+            for candidate in available_models:
+                if _model_config_signature(candidate) == direct_signature:
+                    return os.path.abspath(candidate)
+
+    requested_lower = requested.lower()
+    exact_matches = []
+    speaker_matches = []
+    fuzzy_matches = []
+    for candidate in available_models:
+        if not _is_valid_svc_model_dir(candidate):
+            continue
+        basename = os.path.basename(candidate)
+        if basename.lower() == requested_lower or _model_display_name(candidate) == requested_display:
+            exact_matches.append(candidate)
+            continue
+        speakers = [str(value).lower() for value in _read_model_config(candidate).get("spks", []) if value]
+        if requested_lower in speakers:
+            speaker_matches.append(candidate)
+        elif requested_lower and requested_lower in basename.lower():
+            fuzzy_matches.append(candidate)
+
+    matches = exact_matches or speaker_matches or fuzzy_matches
+    if len(matches) == 1:
+        return os.path.abspath(matches[0])
+    if len(matches) > 1:
+        raise ValueError(f"SVC 模型名称不唯一: {requested_display}")
+
+    choices = ", ".join(_model_display_name(path) for path in available_models) or "无"
+    raise ValueError(f"找不到 SVC 模型: {requested_display}；可用模型: {choices}")
+
 def _find_gradio_endpoint(keyword=None, min_returns=None, max_params=None):
     info = _get_info()
     for source in ["named_endpoints", "unnamed_endpoints"]:
@@ -440,24 +509,8 @@ def _get_search_path_index(model_path):
 def load_svc_model(model_name: str):
     global current_speaker_id, current_model_type_index, loaded_speakers, _gradio_info_cache
     print(f"Requesting SVC-Fusion to load model: {model_name}")
-
-    import re as _re
-    m_match = _re.search(r'\(([^)]+)\)\s*$', model_name)
-    if m_match:
-        model_name = m_match.group(1)
-
-    resolved_path = model_name
-    if not os.path.isdir(model_name):
-        for m in available_models:
-            bn = os.path.basename(m)
-            if bn == model_name:
-                resolved_path = m
-                break
-        else:
-            for m in available_models:
-                if model_name in os.path.basename(m):
-                    resolved_path = m
-                    break
+    resolved_path = _resolve_svc_model_path(model_name)
+    print(f"Resolved SVC model path: {resolved_path}")
 
     config = _read_model_config(resolved_path)
     model_type_index = config.get("model_type_index", -1)
@@ -715,6 +768,61 @@ def _build_infer_params(endpoint_name, audio_data, speaker_id, key_shift, f0_met
 
     return data
 
+def _audio_probe(path):
+    info = soundfile.info(path)
+    if info.frames <= 0 or info.samplerate <= 0:
+        raise ValueError(f"audio has no decodable samples: {path}")
+
+    peak = 0.0
+    with soundfile.SoundFile(path) as stream:
+        while True:
+            block = stream.read(262144, dtype="float32", always_2d=True)
+            if not block.size:
+                break
+            peak = max(peak, float(np.max(np.abs(block))))
+
+    return info.frames / float(info.samplerate), peak
+
+
+def _validate_svc_output(output_path, input_audio_path):
+    file_size = os.path.getsize(output_path)
+    if file_size < 4096:
+        raise ValueError(f"SVC output is too small ({file_size} bytes): {output_path}")
+
+    output_duration, output_peak = _audio_probe(output_path)
+    input_duration, _ = _audio_probe(input_audio_path)
+    min_duration = max(1.0, input_duration * 0.60)
+    max_duration = max(input_duration * 1.60, input_duration + 20.0)
+    if not min_duration <= output_duration <= max_duration:
+        raise ValueError(
+            "SVC output duration is invalid: "
+            f"output={output_duration:.2f}s input={input_duration:.2f}s"
+        )
+    if output_peak <= 1e-7:
+        raise ValueError(f"SVC output is silent: {output_path}")
+
+    print(
+        "SVC output validated: "
+        f"duration={output_duration:.2f}s, input={input_duration:.2f}s, "
+        f"peak={output_peak:.6f}, size={file_size}"
+    )
+    return file_size
+
+
+def _cached_mix_is_valid(cache_path):
+    try:
+        if os.path.getsize(cache_path) < 4096:
+            return False, "file is smaller than 4096 bytes"
+        duration, peak = _audio_probe(cache_path)
+        if duration < 2.0:
+            return False, f"duration is only {duration:.2f}s"
+        if peak <= 1e-7:
+            return False, "audio is silent"
+        return True, f"duration={duration:.2f}s peak={peak:.6f}"
+    except Exception as exc:
+        return False, f"audio probe failed: {exc}"
+
+
 def convert_svc(input_audio_path: str, speaker_id: str, key_shift: int, progress_callback=None, f0_method="fcpe"):
     global current_model_type_index, loaded_speakers
     print(f"SVC-Fusion inference: requested_speaker={speaker_id}, key_shift={key_shift}")
@@ -809,9 +917,7 @@ def convert_svc(input_audio_path: str, speaker_id: str, key_shift: int, progress
             file_path = output_audio
 
         if file_path and os.path.exists(file_path):
-            file_size = os.path.getsize(file_path)
-            if file_size < 1000:
-                print(f"WARNING: Output audio file is suspiciously small ({file_size} bytes), may be empty/error audio")
+            file_size = _validate_svc_output(file_path, input_audio_path)
             print(f"Inference result saved: {file_path} ({file_size} bytes)")
             return file_path
         elif file_path:
@@ -822,12 +928,15 @@ def convert_svc(input_audio_path: str, speaker_id: str, key_shift: int, progress
             else:
                 download_url = f"{SVC_API_BASE}/file={file_path}"
             print(f"Downloading result: {download_url}")
-            audio_content = requests.get(download_url, timeout=TIMEOUT).content
+            response = requests.get(download_url, timeout=TIMEOUT)
+            response.raise_for_status()
+            audio_content = response.content
             os.makedirs("./temp", exist_ok=True)
             local_temp_path = f"./temp/svc_output_{int(_time.time())}.wav"
             with open(local_temp_path, "wb") as f:
                 f.write(audio_content)
-            print(f"Inference result saved: {local_temp_path}")
+            file_size = _validate_svc_output(local_temp_path, input_audio_path)
+            print(f"Inference result saved: {local_temp_path} ({file_size} bytes)")
             return local_temp_path
         else:
             raise Exception(f"Cannot parse output audio: {type(output_audio)} = {output_audio}")
@@ -982,12 +1091,16 @@ def convert(song_name_src, key_shift, vocal_vol, inst_vol, model_dropdown, rever
         msst_normalize, vocal_postprocess, shift_accompaniment
     )
     cache_path = f"temp/{sanitize_filename(source_cache_name)}_{cache_key}_SVC.mp3"
-    if os.path.isfile(cache_path) and os.path.getsize(cache_path) > 0:
-        os.utime(cache_path, None)
-        print(f"Cache hit, returning: {cache_path}")
-        progress(1.0, desc="Cache hit, returning directly!")
-        progress_local.progress = None
-        return cache_path, "true"
+    if os.path.isfile(cache_path):
+        cache_valid, cache_detail = _cached_mix_is_valid(cache_path)
+        if cache_valid:
+            os.utime(cache_path, None)
+            print(f"Cache hit, returning: {cache_path} ({cache_detail})")
+            progress(1.0, desc="Cache hit, returning directly!")
+            progress_local.progress = None
+            return cache_path, "true"
+        print(f"Invalid cache removed: {cache_path} ({cache_detail})")
+        os.remove(cache_path)
 
     if is_local_file:
         vocal_cache_path = f"./output/{split_model}/{safe_name}/vocal_{safe_name}.wav_10.wav"
@@ -1242,6 +1355,7 @@ initial_models = refresh_models_svc()
 if initial_models:
     display_list = [_model_display_name(m) for m in initial_models]
     model_dropdown.choices = display_list
+    model_dropdown.value = display_list[0]
 else:
     print("Warning: failed to load model list, ensure SVC-Fusion is running")
 

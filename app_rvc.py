@@ -30,24 +30,19 @@ parser.add_argument(
     '--is_nohalf', action='store_true'
 )
 parser.add_argument(
-    '--dml', action='store_true'
+    '--dml', action='store_true', help='(已废弃) DirectML 已被原生 AMD ROCm 取代'
 )
 a = parser.parse_args()
 
-use_dml = a.dml
-if use_dml:
-    try:
-        import torch_directml
-        device = torch_directml.device(torch_directml.default_device())
-        is_half = False
-        print(f"[AMD] 使用 DirectML 设备: {device}")
-    except ImportError:
-        print("[AMD] torch_directml 未安装，回退到 CPU")
-        device = 'cpu'
-        is_half = False
+if a.dml:
+    print("[ROCm] --dml 参数已废弃，本版本使用原生 AMD ROCm，忽略该参数")
+
+is_half = not a.is_nohalf
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+if device == 'cuda':
+    print(f"[ROCm] PyTorch {torch.__version__}, HIP {torch.version.hip}, GPU: {torch.cuda.get_device_name(0)}")
 else:
-    is_half = not a.is_nohalf
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print("[ROCm] 未检测到 AMD ROCm GPU，回退到 CPU（速度会很慢）")
 headers = {
     "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
 }
